@@ -70,7 +70,6 @@ class Go1MujocoEnv(MujocoEnv):
             "xy_angular_vel": 0.05,  
             "action_rate": 0.01,
             "joint_limit": 1.0,
-            "joint_velocity": 0.01,
             "joint_acceleration":2.5e-7 ,
             "orientation": 0.05,
             "stillness": 1,

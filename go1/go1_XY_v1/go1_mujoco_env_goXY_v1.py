@@ -34,7 +34,9 @@ class Go1MujocoEnv(MujocoEnv):
 
     def __init__(self, ctrl_type=None, **kwargs):
 
-        model_path = Path(os.path.expanduser(f"scene_position.xml"))
+
+
+        model_path = Path(os.path.expanduser(f"~/tfg/unitree_go1/scene_position.xml"))
 
         
 
@@ -42,12 +44,12 @@ class Go1MujocoEnv(MujocoEnv):
             self,
             model_path=model_path.absolute().as_posix(),
             frame_skip=10,  # Perform an action every 10 frames (dt(=0.002) * 10 = 0.02 seconds -> 50hz action rate)
-            observation_space=None,  
+            observation_space=None,  # Manually set afterwards
             default_camera_config=DEFAULT_CAMERA_CONFIG,
             **kwargs,
         )
 
-        
+        # Update metadata to include the render FPS
         self.metadata = {
             "render_modes": [
                 "human",
@@ -57,52 +59,45 @@ class Go1MujocoEnv(MujocoEnv):
             "render_fps": 60,
         }
         self._last_render_time = -1.0
+        #self._max_episode_time_sec = kwargs.get("max_episode_time_sec", 15.0)
         self.test_mode=kwargs.get("test_mode", False)
         self._max_episode_time_sec = 15.0
         self._step = 0
 
-        # Pesos de las recompensas
+        # Weights for the reward and cost functions
         self.reward_weights = {
             "linear_vel_tracking": 00,  
             "angular_vel_tracking": 1.0,
-            "healthy": 0.05,  
+            "healthy": 1,  
             "feet_airtime": 1, 
-            "target_xy":4.0,
-            "header_xy":1.0,
-            "velocity_xy": 2.0,
-            "termination": 4.0,
+            "target_xy":5.0,
+            "header_xy":3.0,
+            "velocity_xy": 2.0, 
         }
-
-        # Pesos de las penalizaciones
         self.cost_weights = {
             "torque": 0.0005,
             "vertical_vel": 0.4,  
-            "xy_angular_vel": 0.001,  
+            "xy_angular_vel": 0.02,  
             "action_rate": 0.01,
             "joint_limit": 1.0, 
-            "joint_velocity": 0.01, 
             "joint_acceleration":5e-6 ,
-            "orientation": 0.05,
+            "orientation": 0.05, 
         }
 
         self._curriculum_base = 0.3
         self._gravity_vector = np.array(self.model.opt.gravity)
-        self._default_joint_position = np.array(self.model.key_ctrl[0])
 
 
         #posicion a ir xy
         self._target_position=[-4,4]
-        self.distance_umbral=0.5
+
+        self.distance_umbral=0.3
         self.velocity_treshold=0.2
         self._unhealthy_counter =0
 
-        self._target_position_min = np.array([-5.0, -5.0])
-        self._target_position_max = np.array([5.0, 5.0])
-
-
         # vx (m/s), vy (m/s), wz (rad/s)
-        self._desired_velocity_min = np.array([-1, 0, -1])
-        self._desired_velocity_max = np.array([1, 0, 1])
+        self._desired_velocity_min = np.array([-1, 0, -0.5])
+        self._desired_velocity_max = np.array([1, 0, 0.5])
         self._desired_velocity = self._sample_desired_vel()  
         self._obs_scale = {
             "linear_velocity": 5.0,
@@ -158,14 +153,11 @@ class Go1MujocoEnv(MujocoEnv):
 
         observation = self._get_obs()
         reward, reward_info = self._calc_reward(action)
-        
         terminated = not self.is_healthy 
         
-        #terminated si se llega a las pos target a una distancia umbral(0.5)
-        if np.linalg.norm(self.data.qpos[:2] - self._target_position) < self.distance_umbral:
+        #terminated si se llega a las pos target a una distancia umbral
+        if np.linalg.norm(self.data.qpos[:2] - self._target_position) < 0.05:
             terminated=True
-            reward += 10*self.reward_weights["termination"]
-            
         truncated = self._step >= (self._max_episode_time_sec / self.dt)
         info = {
             "x_position": self.data.qpos[0],
@@ -175,9 +167,10 @@ class Go1MujocoEnv(MujocoEnv):
         }
 
         
-
+        
         if not self.is_healthy:
             self._unhealthy_counter += 1
+        
 
         if self.render_mode == "human" and (self.data.time - self._last_render_time) > (
             1.0 / self.metadata["render_fps"]
@@ -189,7 +182,9 @@ class Go1MujocoEnv(MujocoEnv):
 
         return observation, reward, terminated, truncated, info
 
+
     
+
     @property
     def is_healthy(self):
         state = self.state_vector()
@@ -236,10 +231,10 @@ class Go1MujocoEnv(MujocoEnv):
         vel_sqr_error = np.square(self._desired_velocity[2] - self.data.qvel[5])
         return np.exp(-vel_sqr_error / self._tracking_velocity_sigma)
 
-
     @property
+   
     def feet_air_time_reward(self):
-        #Premia pasos largos (> 0.1s), penaliza pasos cortos, fomenta simetría y coordinación
+        # Premia pasos largos (> 0.02s), penaliza pasos cortos, fomenta simetría y coordinación."""
         feet_contact_force_mag = self.feet_contact_forces  # tamaño (4,)
         curr_contact = feet_contact_force_mag > 1.0
         contact_filter = np.logical_or(curr_contact, self._last_contacts)
@@ -248,14 +243,13 @@ class Go1MujocoEnv(MujocoEnv):
         first_contact = (self._feet_air_time > 0.0) * contact_filter
         self._feet_air_time += self.dt
 
-        min_air_time = 0.1 
+        min_air_time = 0.02 
         stride_reward = (self._feet_air_time - min_air_time) * first_contact
-        
         stride_reward = np.maximum(stride_reward, 0.0)
 
-        # Penalización por pasos cortos
+        # Nueva penalización por pasos cortos
         short_steps = (self._feet_air_time < min_air_time) * first_contact
-        short_step_penalty = np.sum(short_steps) * 0.05  # penaliza -0.1 por cada pata que no cumplió
+        short_step_penalty = np.sum(short_steps) * 0.1  # penaliza -0.1 por cada pata que no cumplió
 
         # Agrupar patas por lateralidad
         right_air = self._feet_air_time[[0, 2]]  # FR, RR
@@ -294,64 +288,79 @@ class Go1MujocoEnv(MujocoEnv):
         return air_time_reward
 
 
-
+    
 
     @property
     def healthy_reward(self):
         return self.is_healthy
     
-    # Recompensa para fomentar ir a xy
+    #añadida para ir a xy
     @property
     def target_position_reward(self):
         current_pos = self.data.qpos[:2]  # posición actual [x, y]
         distance = np.linalg.norm(current_pos - self._target_position)
+        velocity = np.linalg.norm(self.data.qvel[:2])
         reward = np.exp(-distance / self._tracking_velocity_sigma)
-        
+
+        # Bonus si está muy cerca 
+        if distance < self.distance_umbral:
+            reward+=5
+            if velocity < self.velocity_treshold:
+                reward += 5  # BONUS grande por estar prácticamente encima del objetivo
+            else:
+                 reward -= 2.5 # penalización por no parar
         return reward
     
-
-    # Recompensa para orinetarse ahcia el target
+    #para encarar el objetivo
     @property
     def heading_alignment_reward(self):
-        
-
         # Dirección normalizada hacia el objetivo (plano XY)
         current_pos = self.data.qpos[:2]
         to_target = self._target_position - current_pos
         dist = np.linalg.norm(to_target)
+        if dist < 1e-6:
+            return 1.0  # Si ya estás en el objetivo, máxima alineación
 
-        
         dir_to_target = to_target / dist
 
+        # Extraer yaw actual del robot
         w, x, y, z = self.data.qpos[3:7]
         _, _, yaw = self.euler_from_quaternion(w, x, y, z)
 
+        
         forward = np.array([np.cos(yaw), np.sin(yaw)])
 
+        
         cos_sim = np.dot(forward, dir_to_target)
         
         return (cos_sim + 1.0) / 2.0
 
 
-    # Recompensa por avanzar hacia objetivo
+    #avanzar hacia objetivo
     @property
     def reward_velocity_towards_target(self):
         direction = self._target_position - self.data.qpos[:2]
-        direction_norm = np.linalg.norm(direction)
-
-        direction = direction / direction_norm  # Vector unitario hacia el objetivo
+        direction = direction / (np.linalg.norm(direction) + 1e-6)
         velocity = self.data.qvel[:2]
-        forward_velocity = np.dot(velocity, direction)  
-
-        # Se normaliza con la vel máxima
-        max_velocity = self._desired_velocity_max[0]
-        normalized = np.clip(forward_velocity / max_velocity, -1.0, 1.0)
+        forward_velocity = np.dot(velocity, direction)
         
-        return normalized 
+        return forward_velocity  
 
     ######### Negative Reward functions #########
 
+    #Propiedad  para evitar que no se mueva
+    @property
+    def stillness_penalty(self):
+        velocity_mag = np.linalg.norm(self.data.qvel[:2])  # Solo velocidad x, y
+        if self.data.qvel[1] ==0:
+            reward=50
+        #return float(velocity_mag < 0.05) * 0.2  # Penaliza si está casi parado
+        else:
+            reward=0
+        return reward
     
+
+
     @property
     def non_flat_base_cost(self):
         # Penaliza por no estar paraleleo al suelo
@@ -395,10 +404,8 @@ class Go1MujocoEnv(MujocoEnv):
     def curriculum_factor(self):
         # Permite que el entorno se complique con el tiempo
         return self._curriculum_base**0.997
-
-    
-
     def _calc_reward(self, action):
+        
 
         # Positive Rewards
         linear_vel_tracking_reward = (self.linear_velocity_tracking_reward* self.reward_weights["linear_vel_tracking"])
@@ -406,15 +413,13 @@ class Go1MujocoEnv(MujocoEnv):
         healthy_reward = self.healthy_reward * self.reward_weights["healthy"]
         feet_air_time_reward = (self.feet_air_time_reward * self.reward_weights["feet_airtime"])
         target_xy_reward=self.target_position_reward * self.reward_weights["target_xy"]
-
         reward_velocity_towards_target=self.reward_velocity_towards_target * self.reward_weights["velocity_xy"]
-
         reward_heading_alignment=self.heading_alignment_reward * self.reward_weights["header_xy"]
 
-        
+       
         rewards = (
-                linear_vel_tracking_reward
-                + target_xy_reward
+                #linear_vel_tracking_reward
+                target_xy_reward
                 + reward_heading_alignment
                 + reward_velocity_towards_target
                 + angular_vel_tracking_reward
@@ -426,12 +431,12 @@ class Go1MujocoEnv(MujocoEnv):
         # Negative Costs
         ctrl_cost = self.torque_cost * self.cost_weights["torque"]
         action_rate_cost = (self.action_rate_cost(action) * self.cost_weights["action_rate"])
-        vertical_vel_cost = (self.vertical_velocity_cost * self.cost_weights["vertical_vel"])
+        vertical_vel_cost = ( self.vertical_velocity_cost * self.cost_weights["vertical_vel"])
         xy_angular_vel_cost = (self.xy_angular_velocity_cost * self.cost_weights["xy_angular_vel"])
         joint_limit_cost = self.joint_limit_cost * self.cost_weights["joint_limit"]
         joint_acceleration_cost = (self.acceleration_cost * self.cost_weights["joint_acceleration"])
         orientation_cost = self.non_flat_base_cost * self.cost_weights["orientation"]
-
+       
 
         costs = (
             ctrl_cost
@@ -441,8 +446,8 @@ class Go1MujocoEnv(MujocoEnv):
             + joint_limit_cost
             + joint_acceleration_cost
             + orientation_cost
-            
         )
+        
         
         reward = rewards - self.curriculum_factor * costs
         reward_info = {
@@ -486,9 +491,9 @@ class Go1MujocoEnv(MujocoEnv):
         ).clip(-self._clip_obs_threshold, self._clip_obs_threshold)
 
         return curr_obs
-    
+
     def reset_model(self):
-        # Reseta la posicion incial con ruido
+        # Reseta las posiciones iniciales con ruido
         self.data.qpos[:] = self.model.key_qpos[0] + self.np_random.uniform(
             low=-self._reset_noise_scale,
             high=self._reset_noise_scale,
