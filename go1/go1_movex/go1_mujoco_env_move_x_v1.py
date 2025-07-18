@@ -1,0 +1,459 @@
+from gymnasium import spaces
+from gymnasium.envs.mujoco import MujocoEnv
+
+import mujoco
+
+import numpy as np
+from pathlib import Path
+
+from pathlib import Path
+import os
+
+
+DEFAULT_CAMERA_CONFIG = {
+    "azimuth": 90.0,
+    "distance": 3.0,
+    "elevation": -25.0,
+    "lookat": np.array([0., 0., 0.]),
+    "fixedcamid": 0,
+    "trackbodyid": -1,
+    "type": 2,
+}
+
+
+class Go1MujocoEnv(MujocoEnv):
+
+    metadata = {
+        "render_modes": [
+            "human",
+            "rgb_array",
+            "depth_array",
+        ],
+    }
+
+    def __init__(self, ctrl_type=None, **kwargs):
+        #se ejecuta dentro de la carpeta
+        model_path = Path(os.path.expanduser(f"scene_position.xml"))
+
+        MujocoEnv.__init__(
+            self,
+            model_path=model_path.absolute().as_posix(),
+            frame_skip=10,  # Perform an action every 10 frames (dt(=0.002) * 10 = 0.02 seconds -> 50hz action rate)
+            observation_space=None,  
+            default_camera_config=DEFAULT_CAMERA_CONFIG,
+            **kwargs,
+        )
+
+
+        self.metadata = {
+            "render_modes": [
+                "human",
+                "rgb_array",
+                "depth_array",
+            ],
+            "render_fps": 60,
+        }
+        self._last_render_time = -1.0
+        self._max_episode_time_sec = 15.0
+        self._step = 0
+
+        self.reward_weights = {
+            "linear_vel_tracking": 5.0,  
+            "angular_vel_tracking": 1.0, 
+            "healthy": 1,  
+            "feet_airtime": 1, 
+            "heading_alignment": 1.0 
+        }
+        self.cost_weights = {
+            "torque": 0.0002,
+            "vertical_vel": 0.5,  
+            "xy_angular_vel": 0.05,  
+            "action_rate": 0.01,
+            "joint_limit": 1.0,
+            "joint_velocity": 0.01,
+            "joint_acceleration":2.5e-7 ,
+            "orientation": 0.05,
+            "stillness": 1
+        }
+
+        self._curriculum_base = 0.3
+        self._gravity_vector = np.array(self.model.opt.gravity)
+        
+
+        self._unhealthy_counter = 0
+        
+
+        # vx (m/s), vy (m/s), wz (rad/s)
+        self._desired_velocity_min = np.array([1, -0.0, -0.0])
+        self._desired_velocity_max = np.array([1, 0.0, 0.0])
+        self._desired_velocity = self._sample_desired_vel()  
+        self._obs_scale = {
+            "linear_velocity": 5.0,
+            "angular_velocity": 0.25,
+            "dofs_position": 1.0,
+            "dofs_velocity": 0.05,
+        }
+        self._tracking_velocity_sigma = 0.6 # controla la tolerancia a cambios 
+
+        # Para detrminar si es un estado terminal
+        self._healthy_z_range = (0.22, 0.65)
+        self._healthy_pitch_range = (-np.deg2rad(10), np.deg2rad(10))
+        self._healthy_roll_range = (-np.deg2rad(10), np.deg2rad(10))
+
+        self._feet_air_time = np.zeros(4)
+        self._last_contacts = np.zeros(4)
+        self._cfrc_ext_feet_indices = [4, 7, 10, 13]  # 4:FR, 7:FL, 10:RR, 13:RL
+        self._cfrc_ext_contact_indices = [2, 3, 5, 6, 8, 9, 11, 12]
+
+        
+        dof_position_limit_multiplier = 0.9  # No penaliza el 90% del rango
+        ctrl_range_offset = (0.5 * (1 - dof_position_limit_multiplier)* (self.model.actuator_ctrlrange[:, 1]- self.model.actuator_ctrlrange[:, 0]))
+
+        # El primer valor se ignora
+        self._soft_joint_range = np.copy(self.model.actuator_ctrlrange)
+        self._soft_joint_range[:, 0] += ctrl_range_offset
+        self._soft_joint_range[:, 1] -= ctrl_range_offset
+
+        self._reset_noise_scale = 0.1
+
+        # Action: 12 torque values
+        self._last_action = np.zeros(12)
+
+        self._clip_obs_threshold = 100.0
+        self.observation_space = spaces.Box(
+            low=-np.inf, high=np.inf, shape=self._get_obs().shape, dtype=np.float64
+        )
+
+        feet_site = [
+            "FR",
+            "FL",
+            "RR",
+            "RL",
+        ]
+        self._feet_site_name_to_id = {f: mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE.value, f)for f in feet_site}
+
+        self._main_body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY.value, "trunk")
+
+    def step(self, action):
+        self._step += 1
+        self.do_simulation(action, self.frame_skip)
+
+        observation = self._get_obs()
+        reward, reward_info = self._calc_reward(action)
+        terminated = not self.is_healthy
+        truncated = self._step >= (self._max_episode_time_sec / self.dt)
+        info = {
+            "x_position": self.data.qpos[0],
+            "y_position": self.data.qpos[1],
+            "distance_from_origin": np.linalg.norm(self.data.qpos[0:2], ord=2),
+            **reward_info,
+        }
+
+        if not self.is_healthy:
+            self._unhealthy_counter += 1
+
+        if self.render_mode == "human" and (self.data.time - self._last_render_time) > (1.0 / self.metadata["render_fps"]):
+            self.render()
+            self._last_render_time = self.data.time
+
+        self._last_action = action
+
+        return observation, reward, terminated, truncated, info
+
+
+    
+
+    @property
+    def is_healthy(self):
+        state = self.state_vector()
+        min_z, max_z = self._healthy_z_range
+        is_healthy = np.isfinite(state).all() and min_z <= state[2] <= max_z
+
+        min_roll, max_roll = self._healthy_roll_range
+        is_healthy = is_healthy and min_roll <= state[4] <= max_roll
+
+        min_pitch, max_pitch = self._healthy_pitch_range
+        is_healthy = is_healthy and min_pitch <= state[5] <= max_pitch
+
+        return is_healthy
+
+    @property
+    def projected_gravity(self):
+        w, x, y, z = self.data.qpos[3:7]
+        euler_orientation = np.array(self.euler_from_quaternion(w, x, y, z))
+        projected_gravity_not_normalized = (
+            np.dot(self._gravity_vector, euler_orientation) * euler_orientation
+        )
+        if np.linalg.norm(projected_gravity_not_normalized) == 0:
+            return projected_gravity_not_normalized
+        else:
+            return projected_gravity_not_normalized / np.linalg.norm(
+                projected_gravity_not_normalized
+            )
+
+    @property
+    def feet_contact_forces(self):
+        feet_contact_forces = self.data.cfrc_ext[self._cfrc_ext_feet_indices]
+        return np.linalg.norm(feet_contact_forces, axis=1)
+
+    ######### Positive Reward functions #########
+    @property
+    def linear_velocity_tracking_reward(self):
+        vel_sqr_error = np.sum(
+            np.square(self._desired_velocity[:2] - self.data.qvel[:2])
+        )
+        return np.exp(-vel_sqr_error / self._tracking_velocity_sigma)
+
+    @property
+    def angular_velocity_tracking_reward(self):
+        vel_sqr_error = np.square(self._desired_velocity[2] - self.data.qvel[5])
+        return np.exp(-vel_sqr_error / self._tracking_velocity_sigma)
+
+    @property
+    def feet_air_time_reward(self):
+        
+        feet_contact_force_mag = self.feet_contact_forces
+        curr_contact = feet_contact_force_mag > 1.0
+        contact_filter = np.logical_or(curr_contact, self._last_contacts)
+        self._last_contacts = curr_contact
+
+        # Detectar primer contacto después de estar en el aire
+        first_contact = (self._feet_air_time > 0.0) * contact_filter
+        self._feet_air_time += self.dt
+
+        # Solo premiar si el pie ha estado en el aire más de 0.5 segundos
+        stride_reward = (self._feet_air_time - 0.5) * first_contact
+        stride_reward = np.maximum(stride_reward, 0.0)  # eliminar penalización negativa
+
+        air_time_reward = np.sum(stride_reward)
+
+        # No premiar si no hay intención de moverse
+        air_time_reward *= np.linalg.norm(self._desired_velocity[:2]) > 0.1
+
+        # Resetear tiempo en el aire para los pies que han hecho contacto
+        self._feet_air_time *= ~contact_filter
+
+        return air_time_reward
+
+
+    @property
+    def healthy_reward(self):
+        return self.is_healthy
+    
+
+    @property
+    def heading_alignment_reward(self):
+        # Obtener orientación actual en Euler
+        w, x, y, z = self.data.qpos[3:7]
+        _, _, yaw = self.euler_from_quaternion(w, x, y, z)
+        
+        # Recompensa máxima cuando yaw = 0 (alineado con eje X)
+        return np.exp(-np.square(yaw))  
+
+
+
+    ######### Negative Reward functions #########
+    @property
+    def stillness_penalty(self):
+        # Penaliza no moverse
+        if self.data.qvel[1] ==0:
+            reward=50
+        else:
+            reward=0
+        return reward
+    
+
+    @property
+    def non_flat_base_cost(self):
+        # Penaliza por no estar paraleleo al suelo
+        return np.sum(np.square(self.projected_gravity[:2]))
+
+    @property
+    def joint_limit_cost(self):
+        # Penaliza por salirse de los limites establecidos de las articulaciones
+        out_of_range = (self._soft_joint_range[:, 0] - self.data.qpos[7:]).clip(
+            min=0.0
+        ) + (self.data.qpos[7:] - self._soft_joint_range[:, 1]).clip(min=0.0)
+        return np.sum(out_of_range)
+
+    @property
+    def torque_cost(self):
+        # Penaliza el uso de torque
+        return np.sum(np.square(self.data.qfrc_actuator[-12:]))
+
+    @property
+    def vertical_velocity_cost(self):
+        # Penaliza vel en z
+        return np.square(self.data.qvel[2])
+
+    @property
+    def xy_angular_velocity_cost(self):
+        # Penaliza vel angular en x,y
+        return np.sum(np.square(self.data.qvel[3:5]))
+
+    
+    def action_rate_cost(self, action):
+        # Penaliza moviminetos bruscos
+        return np.sum(np.square(self._last_action - action))
+
+    @property
+    def acceleration_cost(self):
+        # Penaliza aceleraciones
+        return np.sum(np.square(self.data.qacc[6:]))
+
+
+    @property
+    def curriculum_factor(self):
+        # Permite que el entorno se complique con el tiempo
+        return self._curriculum_base**0.997
+
+    def _calc_reward(self, action):
+        
+
+        # Positive Rewards
+        linear_vel_tracking_reward = (self.linear_velocity_tracking_reward * self.reward_weights["linear_vel_tracking"])
+
+        angular_vel_tracking_reward = (self.angular_velocity_tracking_reward * self.reward_weights["angular_vel_tracking"])
+
+        healthy_reward = (self.healthy_reward * self.reward_weights["healthy"])
+
+        feet_air_time_reward = (self.feet_air_time_reward * self.reward_weights["feet_airtime"])
+
+        heading_alignment_reward = (self.heading_alignment_reward * self.reward_weights["heading_alignment"])
+
+        rewards = (
+            linear_vel_tracking_reward
+            + angular_vel_tracking_reward
+            + healthy_reward
+            + feet_air_time_reward
+            + heading_alignment_reward
+        )
+
+        # Negative Costs
+        ctrl_cost = self.torque_cost * self.cost_weights["torque"]
+
+        action_rate_cost = (self.action_rate_cost(action) * self.cost_weights["action_rate"])
+
+        vertical_vel_cost = (self.vertical_velocity_cost * self.cost_weights["vertical_vel"])
+
+        xy_angular_vel_cost = (self.xy_angular_velocity_cost * self.cost_weights["xy_angular_vel"])
+
+        joint_limit_cost = self.joint_limit_cost * self.cost_weights["joint_limit"]
+
+        joint_acceleration_cost = (self.acceleration_cost * self.cost_weights["joint_acceleration"])
+
+        orientation_cost = self.non_flat_base_cost * self.cost_weights["orientation"]
+
+        stillness_penalty = self.stillness_penalty * self.cost_weights["stillness"]
+        costs = (
+            ctrl_cost
+            + action_rate_cost
+            + vertical_vel_cost
+            + xy_angular_vel_cost
+            + joint_limit_cost
+            + joint_acceleration_cost
+            + orientation_cost
+            + stillness_penalty
+        )
+        
+
+
+        reward = rewards - self.curriculum_factor * costs
+        reward_info = {
+            "linear_vel_tracking_reward": linear_vel_tracking_reward,
+            "reward_ctrl": -ctrl_cost,
+            "reward_survive": healthy_reward,
+        }
+
+        return reward, reward_info
+
+    def _get_obs(self):
+        # The first three indices are the global x,y,z position of the trunk of the robot
+        # The second four are the quaternion representing the orientation of the robot
+        # The above seven values are ignored since they are privileged information
+        # The remaining 12 values are the joint positions
+        # The joint positions are relative to the starting position
+        dofs_position = self.data.qpos[7:].flatten() - self.model.key_qpos[0, 7:]
+
+        # The first three values are the global linear velocity of the robot
+        # The second three are the angular velocity of the robot
+        # The remaining 12 values are the joint velocities
+        velocity = self.data.qvel.flatten()
+        base_linear_velocity = velocity[:3]
+        base_angular_velocity = velocity[3:6]
+        dofs_velocity = velocity[6:]
+
+        desired_vel = self._desired_velocity
+        last_action = self._last_action
+        projected_gravity = self.projected_gravity
+
+        curr_obs = np.concatenate(
+            (
+                base_linear_velocity * self._obs_scale["linear_velocity"],
+                base_angular_velocity * self._obs_scale["angular_velocity"],
+                projected_gravity,
+                desired_vel * self._obs_scale["linear_velocity"],
+                dofs_position * self._obs_scale["dofs_position"],
+                dofs_velocity * self._obs_scale["dofs_velocity"],
+                last_action,
+            )
+        ).clip(-self._clip_obs_threshold, self._clip_obs_threshold)
+
+        return curr_obs
+
+    def reset_model(self):
+        # Resetea la posicion y articulaciones con un poco de ruido inicial
+        self.data.qpos[:] = self.model.key_qpos[0] + self.np_random.uniform(
+            low=-self._reset_noise_scale,
+            high=self._reset_noise_scale,
+            size=self.model.nq,
+        )
+        self.data.ctrl[:] = self.model.key_ctrl[
+            0
+        ] + self._reset_noise_scale * self.np_random.standard_normal(
+            *self.data.ctrl.shape
+        )
+
+        # Resetea las variables
+        self._desired_velocity = self._sample_desired_vel()
+        self._step = 0
+        self._last_action = np.zeros(12)
+        self._feet_air_time = np.zeros(4)
+        self._last_contacts = np.zeros(4)
+        self._last_render_time = -1.0
+
+        self._unhealthy_counter = 0
+
+        observation = self._get_obs()
+
+        return observation
+
+    def _get_reset_info(self):
+        return {
+            "x_position": self.data.qpos[0],
+            "y_position": self.data.qpos[1],
+            "distance_from_origin": np.linalg.norm(self.data.qpos[0:2], ord=2),
+        }
+
+    def _sample_desired_vel(self):
+        desired_vel = np.random.default_rng().uniform(
+            low=self._desired_velocity_min, high=self._desired_velocity_max
+        )
+        return desired_vel
+
+    @staticmethod
+    def euler_from_quaternion(w, x, y, z):
+        t0 = +2.0 * (w * x + y * z)
+        t1 = +1.0 - 2.0 * (x * x + y * y)
+        roll_x = np.arctan2(t0, t1)
+
+        t2 = +2.0 * (w * y - z * x)
+        t2 = +1.0 if t2 > +1.0 else t2
+        t2 = -1.0 if t2 < -1.0 else t2
+        pitch_y = np.arcsin(t2)
+
+        t3 = +2.0 * (w * z + x * y)
+        t4 = +1.0 - 2.0 * (y * y + z * z)
+        yaw_z = np.arctan2(t3, t4)
+
+        return roll_x, pitch_y, yaw_z  # in radians
