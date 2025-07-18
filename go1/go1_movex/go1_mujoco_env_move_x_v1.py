@@ -73,11 +73,13 @@ class Go1MujocoEnv(MujocoEnv):
             "joint_velocity": 0.01,
             "joint_acceleration":2.5e-7 ,
             "orientation": 0.05,
-            "stillness": 1
+            "stillness": 1,
+            "default_joint_position": 0.5
         }
 
         self._curriculum_base = 0.3
         self._gravity_vector = np.array(self.model.opt.gravity)
+        self._default_joint_position = np.array(self.model.key_ctrl[0])
         
 
         self._unhealthy_counter = 0
@@ -300,6 +302,11 @@ class Go1MujocoEnv(MujocoEnv):
     def acceleration_cost(self):
         # Penaliza aceleraciones
         return np.sum(np.square(self.data.qacc[6:]))
+    
+    @property
+    def default_joint_position_cost(self):
+        return np.sum(np.square(self.data.qpos[7:] - self._default_joint_position))
+
 
 
     @property
@@ -345,6 +352,8 @@ class Go1MujocoEnv(MujocoEnv):
         orientation_cost = self.non_flat_base_cost * self.cost_weights["orientation"]
 
         stillness_penalty = self.stillness_penalty * self.cost_weights["stillness"]
+
+        default_joint_position_cost = (self.default_joint_position_cost * self.cost_weights["default_joint_position"])
         costs = (
             ctrl_cost
             + action_rate_cost
@@ -354,6 +363,7 @@ class Go1MujocoEnv(MujocoEnv):
             + joint_acceleration_cost
             + orientation_cost
             + stillness_penalty
+            + default_joint_position_cost
         )
         
 
