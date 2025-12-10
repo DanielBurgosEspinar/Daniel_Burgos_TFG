@@ -47,7 +47,7 @@ python train_final.py --run test --model_path [copiar el path de "best_model"]
 Simplemente contiene los código que con ejecutarlos de manera normal es suficiente
 
 ## Gráficas
-Para comprobar las gráficas de entrenamiento de los difreentes entrenamientos:
+Para comprobar las gráficas de entrenamiento de los diferentes entrenamientos:
 ```bash
 tensorboard --logdir [copiar el path de la carpeta logs que se quiera visualizar]
 ```
